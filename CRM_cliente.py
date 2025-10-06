@@ -15,11 +15,11 @@ import difflib
 import unicodedata
 from datetime import date, datetime
 from pathlib import Path
-
 import pandas as pd
 import streamlit as st
 import shutil
 import altair as alt
+from typing import List, Optional, Dict  # ADDED: typing helpers
 
 # Paths and data dirs
 DATA_DIR = Path("data")
@@ -27,6 +27,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DOCS_DIR = DATA_DIR / "docs"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
 CLIENTES_CSV = DATA_DIR / "clientes.csv"
+# Archivo Excel de respaldo (acumula clientes registrados/importados)
+BACKUP_XLSX = DATA_DIR / "clientes_respaldo.xlsx"
 
 def find_logo_path() -> Path | None:
     # Buscar logo en data/ (logo.png, logo.jpg) o en data/logo subfolder
@@ -45,20 +47,28 @@ SUCURSALES_FILE = DATA_DIR / "sucursales.json"
 def load_sucursales() -> list:
     """
     Carga la lista de sucursales desde un JSON en DATA_DIR. Si no existe, crea el archivo con valores por defecto.
+    Versión corregida y robusta.
     """
-    try:
-        if SUCURSALES_FILE.exists():
-            data = json.loads(SUCURSALES_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                # Normalizar a strings y limpiar
-                return [str(x).strip() for x in data if str(x).strip()]
-    except Exception:
-        pass
-    # Valores por defecto
     defaults = ["TOXQUI", "COLOKTE", "KAPITALIZA"]
     try:
-        SUCURSALES_FILE.write_text(json.dumps(defaults, ensure_ascii=False, indent=2), encoding="utf-8")
+        if SUCURSALES_FILE.exists():
+            try:
+                content = SUCURSALES_FILE.read_text(encoding="utf-8")
+                data = json.loads(content)
+                if isinstance(data, list):
+                    clean = [str(x).strip() for x in data if str(x).strip()]
+                    if clean:
+                        return clean
+            except Exception:
+                # si falla parseo, continuamos y reescribimos con defaults más abajo
+                pass
+        # escribir defaults si no existía o si el archivo estaba corrupto
+        try:
+            SUCURSALES_FILE.write_text(json.dumps(defaults, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
     except Exception:
+        # no bloquear la app por errores IO
         pass
     return defaults
 
@@ -583,23 +593,40 @@ COLUMNS = [
 
 def cargar_clientes() -> pd.DataFrame:
     """
-    Carga el CSV de clientes si existe; si no, devuelve un DataFrame vacío
-    con las columnas esperadas. Se leen todas las columnas como strings y
-    se rellenan valores faltantes con cadenas vacías para evitar NaNs.
+    Carga la fuente de clientes:
+      - Si existe BACKUP_XLSX, se usa como fuente principal.
+      - Si no, se intenta leer CLIENTES_CSV.
+      - Si nada existe, se devuelve DataFrame vacío con columnas esperadas.
     """
     try:
-        if CLIENTES_CSV.exists():
-            df = pd.read_csv(CLIENTES_CSV, dtype=str).fillna("")
-            # Asegurar que existan todas las columnas esperadas
+        # Preferir el Excel de respaldo si existe (mantener histórico como fuente única)
+        if BACKUP_XLSX.exists():
+            try:
+                df = pd.read_excel(BACKUP_XLSX, dtype=str).fillna("")
+            except Exception:
+                # fallback: intentar con engine openpyxl explícito si falla
+                try:
+                    df = pd.read_excel(BACKUP_XLSX, dtype=str, engine="openpyxl").fillna("")
+                except Exception:
+                    df = pd.DataFrame(columns=COLUMNS)
+            # Asegurar columnas esperadas
             for c in COLUMNS:
                 if c not in df.columns:
                     df[c] = ""
-            # Mantener el orden de columnas esperado
             cols = [c for c in COLUMNS if c in df.columns]
-            return df[cols]
+            return df[cols].copy().reset_index(drop=True)
+        # Si no hay BACKUP_XLSX, usar CSV principal si existe (compatibilidad)
+        if CLIENTES_CSV.exists():
+            df = pd.read_csv(CLIENTES_CSV, dtype=str).fillna("")
+            for c in COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            cols = [c for c in COLUMNS if c in df.columns]
+            return df[cols].copy().reset_index(drop=True)
     except Exception:
-        # Si ocurre cualquier error, retornar DataFrame vacío con columnas definidas
+        # no bloquear la app por errores de lectura
         pass
+    # retorno por defecto: DataFrame vacío con columnas definidas
     return pd.DataFrame(columns=COLUMNS)
 
 def guardar_clientes(df: pd.DataFrame):
@@ -622,6 +649,109 @@ def guardar_clientes(df: pd.DataFrame):
         # Mostrar mensaje sencillo en la UI de Streamlit si está disponible
         try:
             st.error(f"Error guardando clientes: {e}")
+        except Exception:
+            pass
+
+
+def append_respaldo_excel(row_or_df):
+    """
+    Añade filas al BACKUP_XLSX (o crea el archivo).
+    - Evita duplicados por 'id' cuando sea posible.
+    - Si no hay motor XLSX disponible, hace fallback a CSV backup.
+    """
+    try:
+        # 1) Normalizar a DataFrame
+        if isinstance(row_or_df, dict):
+            df_new = pd.DataFrame([row_or_df])
+        elif isinstance(row_or_df, pd.DataFrame):
+            df_new = row_or_df.copy()
+        else:
+            return
+
+        # 2) Asegurar columnas básicas y convertir todo a strings
+        for c in COLUMNS:
+            if c not in df_new.columns:
+                df_new[c] = ""
+        df_new = df_new[[c for c in COLUMNS if c in df_new.columns]].astype(str).fillna("")
+
+        # 3) Detectar motor XLSX disponible
+        engine = None
+        try:
+            import openpyxl  # type: ignore
+            engine = "openpyxl"
+        except Exception:
+            try:
+                import xlsxwriter  # type: ignore
+                engine = "xlsxwriter"
+            except Exception:
+                engine = None
+
+        # 4) Si no hay motor, fallback CSV acumulativo (append seguro)
+        if engine is None:
+            csv_path = DATA_DIR / "clientes_respaldo.csv"
+            try:
+                header = not csv_path.exists()
+                df_new.to_csv(csv_path, mode="a" if not header else "w", header=header, index=False, encoding="utf-8")
+            except Exception as e:
+                try:
+                    st.warning(f"Warning respaldo CSV falló: {e}")
+                except Exception:
+                    pass
+            return
+
+        # 5) Leer XLSX existente (si existe) y preparar salida evitando duplicados por 'id'
+        df_out = None
+        if BACKUP_XLSX.exists():
+            try:
+                # Intentar lectura sin engine explícito primero (pandas detecta)
+                df_exist = pd.read_excel(BACKUP_XLSX, dtype=str).fillna("")
+            except Exception:
+                try:
+                    df_exist = pd.read_excel(BACKUP_XLSX, dtype=str, engine=engine).fillna("")
+                except Exception:
+                    df_exist = pd.DataFrame(columns=COLUMNS)
+
+            # Asegurar columnas esperadas en df_exist
+            for c in COLUMNS:
+                if c not in df_exist.columns:
+                    df_exist[c] = ""
+            df_exist = df_exist[[c for c in COLUMNS if c in df_exist.columns]].astype(str).fillna("")
+
+            # Evitar duplicados por 'id' cuando ambas tablas tienen 'id'
+            if "id" in df_exist.columns and "id" in df_new.columns:
+                ids_exist = set(df_exist["id"].astype(str).tolist())
+                df_to_add = df_new[~df_new["id"].astype(str).isin(ids_exist)].copy()
+            else:
+                df_to_add = df_new.copy()
+
+            if not df_to_add.empty:
+                df_out = pd.concat([df_exist, df_to_add], ignore_index=True)
+            else:
+                df_out = df_exist.copy()
+        else:
+            df_out = df_new.copy()
+
+        # 6) Escribir XLSX (sobrescribe). Intentar con engine detectado, luego sin engine si falla.
+        try:
+            df_out.to_excel(BACKUP_XLSX, index=False, engine=engine)
+        except Exception:
+            try:
+                df_out.to_excel(BACKUP_XLSX, index=False)
+            except Exception as e:
+                # último recurso: escribir CSV completo
+                try:
+                    csv_path = DATA_DIR / "clientes_respaldo.csv"
+                    df_out.to_csv(csv_path, index=False, encoding="utf-8")
+                except Exception:
+                    try:
+                        st.warning(f"Error escribiendo respaldo XLSX/CSV: {e}")
+                    except Exception:
+                        pass
+
+    except Exception as e:
+        # No bloquear la app; mostrar warning opcionalmente
+        try:
+            st.warning(f"Respaldo falló: {e}")
         except Exception:
             pass
 
@@ -688,6 +818,7 @@ def append_historial(cid: str, nombre: str, estatus_old: str, estatus_new: str, 
 def eliminar_cliente(cid: str, df: pd.DataFrame, borrar_historial: bool = False) -> pd.DataFrame:
     """
     Elimina al cliente del DataFrame `df`, borra su carpeta de documentos y (opcionalmente) las entradas de historial.
+    Además elimina la fila correspondiente en BACKUP_XLSX / clientes_respaldo.csv para evitar que reaparezca.
     Retorna el DataFrame resultante (y guarda el CSV de clientes).
     """
     try:
@@ -701,16 +832,75 @@ def eliminar_cliente(cid: str, df: pd.DataFrame, borrar_historial: bool = False)
         except Exception:
             pass
 
-        # Eliminar de df
-        df_new = df[df["id"] != cid].reset_index(drop=True)
+        # Eliminar de df principal y guardar CSV
+        df_new = df[df["id"].astype(str) != str(cid)].reset_index(drop=True)
         guardar_clientes(df_new)
+
+        # Eliminar de BACKUP_XLSX y del CSV de respaldo si existen
+        try:
+            # detectar motor xlsx si está disponible
+            engine = None
+            try:
+                import openpyxl  # type: ignore
+                engine = "openpyxl"
+            except Exception:
+                try:
+                    import xlsxwriter  # type: ignore
+                    engine = "xlsxwriter"
+                except Exception:
+                    engine = None
+
+            # 1) actualizar BACKUP_XLSX si existe
+            if BACKUP_XLSX.exists():
+                try:
+                    try:
+                        df_b = pd.read_excel(BACKUP_XLSX, dtype=str)
+                    except Exception:
+                        # intentar con engine si la lectura por defecto falla
+                        if engine:
+                            df_b = pd.read_excel(BACKUP_XLSX, dtype=str, engine=engine)
+                        else:
+                            df_b = pd.DataFrame()
+                    if isinstance(df_b, pd.DataFrame) and not df_b.empty and "id" in df_b.columns:
+                        df_b = df_b[df_b["id"].astype(str) != str(cid)].reset_index(drop=True)
+                        try:
+                            if engine:
+                                df_b.to_excel(BACKUP_XLSX, index=False, engine=engine)
+                            else:
+                                df_b.to_excel(BACKUP_XLSX, index=False)
+                        except Exception:
+                            # fallback: escribir CSV de respaldo completo
+                            csv_path = DATA_DIR / "clientes_respaldo.csv"
+                            try:
+                                df_b.to_csv(csv_path, index=False, encoding="utf-8")
+                            except Exception:
+                                pass
+                except Exception:
+                    # no bloquear si falla la actualización del backup xlsx
+                    pass
+
+            # 2) actualizar clientes_respaldo.csv si existe
+            csv_path = DATA_DIR / "clientes_respaldo.csv"
+            if csv_path.exists():
+                try:
+                    df_c = pd.read_csv(csv_path, dtype=str).fillna("")
+                    if "id" in df_c.columns:
+                        df_c = df_c[df_c["id"].astype(str) != str(cid)].reset_index(drop=True)
+                        try:
+                            df_c.to_csv(csv_path, index=False, encoding="utf-8")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # Borrar historial asociado si se solicita
         if borrar_historial:
             try:
                 if HISTORIAL_CSV.exists():
                     dfh = cargar_historial()
-                    dfh = dfh[dfh["id"] != cid].reset_index(drop=True)
+                    dfh = dfh[dfh["id"].astype(str) != str(cid)].reset_index(drop=True)
                     dfh.to_csv(HISTORIAL_CSV, index=False, encoding="utf-8")
             except Exception:
                 pass
@@ -1186,16 +1376,18 @@ try:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_filtrados_sidebar"
         ):
+            # registrar la acción en historial, sin bloquear si falla
             try:
                 actor = (current_user() or {}).get("user") or (current_user() or {}).get("email")
                 append_historial(
-                "", "", "", "", "", "",
-                "Descarga de Excel filtrados",
-                action="DESCARGA ZIP",  # o "DOCUMENTOS", según quieras categorizarlo
-                actor=actor
+                    "", "", "", "", "", "",
+                    "Descarga de Excel filtrados",
+                    action="DESCARGA ZIP",  # o "DOCUMENTOS", según quieras categorizarlo
+                    actor=actor
                 )
             except Exception:
-                    pass
+                # ignorar errores al escribir el historial para no romper la UI
+                pass
 except Exception:
     # no bloquear la UI si algo falla
     pass
@@ -1415,6 +1607,11 @@ with tab_cli:
                         }
                         base = pd.concat([df_cli, pd.DataFrame([nuevo])], ignore_index=True)
                         guardar_clientes(base)
+                        # Agregar al Excel de respaldo (intento no bloquear la app si falla)
+                        try:
+                            append_respaldo_excel(nuevo)
+                        except Exception:
+                            pass
                         # registrar creación en historial
                         actor = (current_user() or {}).get("user") or (current_user() or {}).get("email")
                         append_historial(cid, nuevo.get("nombre", ""), "", nuevo.get("estatus", ""), "", nuevo.get("segundo_estatus", ""), f"Creado por {actor}", action="CLIENTE AGREGADO", actor=actor)
@@ -1623,7 +1820,7 @@ with tab_asesores:
                 if not pd.isna(min_date) and not pd.isna(max_date):
                     default_start = min_date.date()
                     default_end = max_date.date()
-                    dr = st.date_input("Filtrar por fecha (inicio, fin)", value=(default_start, default_end), key="asesores_date_range")
+                    dr = st.date_input("Filtrar por fecha (desde → hasta)", value=(default_start, default_end), key="asesores_date_range")
                     start_date, end_date = dr if isinstance(dr, tuple) else (dr, dr)
                     try:
                         mask_date = (df_agrupe[date_col].dt.date >= start_date) & (df_agrupe[date_col].dt.date <= end_date)
@@ -2143,6 +2340,20 @@ with tab_import:
                             pass
 
             guardar_clientes(base)
+            # Actualizar respaldo Excel con los nuevos registros agregados (si corresponde)
+            try:
+                # df_norm_obj contiene las filas importadas mapeadas; intentar añadir solo las filas que se agregaron/actualizaron
+                if 'df_norm' in locals() and isinstance(df_norm, pd.DataFrame) and not df_norm.empty:
+                    # convertir df_norm a DataFrame con columnas estándar COLUMNS (sin 'id' forzado)
+                    df_for_backup = pd.DataFrame()
+                    for c in COLUMNS:
+                        df_for_backup[c] = df_norm[c] if c in df_norm.columns else ""
+                    try:
+                        append_respaldo_excel(df_for_backup)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             st.success(f"Importación completada ✅  |  Agregados: {agregados}  ·  Actualizados: {actualizados}")
 
             # Limpieza del estado del mapeo para que no “se quede” la UI
