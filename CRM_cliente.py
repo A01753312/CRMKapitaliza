@@ -1401,7 +1401,7 @@ if logo_path and logo_path.exists():
         # Cambiado para evitar warning: use_container_width en lugar de use_column_width
         st.image(str(logo_path), use_container_width=False, width=250)
 with col_title:
-    st.title("👤 Clientes / CRM")
+    st.title("👤 CRM")
 
 tab_dash, tab_cli, tab_docs, tab_import, tab_hist, tab_asesores = st.tabs(
     ["📊 Dashboard", "📋 Clientes", "📎 Documentos", "📥 Importar", "🗂️ Historial", " 👥 Asesores"]
